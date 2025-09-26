@@ -1,19 +1,20 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from datasets import Dataset
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
 import torch
 import os
-from typing import Dict, Any
+import uvicorn
 
-app = FastAPI(
-    title="Text Classification API",
-    description="API for classifying civic issues into categories: streetlight, garbage, and potholes",
-    version="1.0.0"
-)
+app = FastAPI(title="Civic Issues Text Classifier", description="API for classifying civic issues into categories")
 
 # Global variables for model and tokenizer
 model = None
 tokenizer = None
+id2label = None
+label2id = None
 
 class TextInput(BaseModel):
     text: str
@@ -23,28 +24,102 @@ class PredictionResponse(BaseModel):
     predicted_category: str
     confidence: float
 
-@app.on_event("startup")
-async def load_model():
-    """Load the trained model and tokenizer on startup"""
-    global model, tokenizer
+def train_model():
+    """Train the model if it doesn't exist"""
+    global model, tokenizer, id2label, label2id
+    
+    print("Training model...")
+    
+    # Load dataset
+    df = pd.read_csv("data/textdata.csv")
+    
+    # Allowed labels
+    allowed_labels = ["streetlight", "garbage", "potholes"]
+    
+    # Filter and prepare data
+    df = df[df["label"].isin(allowed_labels)].reset_index(drop=True)
+    
+    # Create mappings
+    label2id = {label: idx for idx, label in enumerate(allowed_labels)}
+    id2label = {idx: label for label, idx in label2id.items()}
+    
+    # Convert labels to IDs
+    df["label_id"] = df["label"].map(label2id)
+    
+    # Split data
+    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+    train_dataset = Dataset.from_pandas(train_df[['text', 'label_id']].rename(columns={'label_id': 'label'}))
+    test_dataset = Dataset.from_pandas(test_df[['text', 'label_id']].rename(columns={'label_id': 'label'}))
+    
+    # Initialize tokenizer and model
+    model_name = "distilbert-base-uncased"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    
+    def tokenize(batch):
+        return tokenizer(batch["text"], padding="max_length", truncation=True, max_length=128)
+    
+    train_dataset = train_dataset.map(tokenize, batched=True)
+    test_dataset = test_dataset.map(tokenize, batched=True)
+    
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, num_labels=len(label2id), id2label=id2label, label2id=label2id
+    )
+    
+    # Training arguments - optimized for deployment
+    training_args = TrainingArguments(
+        output_dir="./model/results",
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        num_train_epochs=1,  # Reduced for faster training
+        weight_decay=0.01,
+        logging_dir="./model/logs",
+        logging_steps=50,
+        report_to=None,
+        push_to_hub=False,
+        dataloader_pin_memory=False,
+        save_steps=500,
+        eval_steps=500,
+    )
+    
+    # Train model
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        processing_class=tokenizer,
+    )
+    
+    trainer.train()
+    
+    # Save model
+    os.makedirs("model/saved_model", exist_ok=True)
+    model.save_pretrained("model/saved_model")
+    tokenizer.save_pretrained("model/saved_model")
+    
+    print("✅ Model training completed and saved!")
+
+def load_model():
+    """Load the trained model"""
+    global model, tokenizer, id2label, label2id
     
     model_path = "model/saved_model"
     
-    # Check if model exists
-    if not os.path.exists(model_path):
-        raise Exception(f"Model not found at {model_path}. Please train the model first.")
-    
-    try:
+    if os.path.exists(model_path):
+        print("Loading existing model...")
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = AutoModelForSequenceClassification.from_pretrained(model_path)
-        print("✅ Model and tokenizer loaded successfully")
-    except Exception as e:
-        raise Exception(f"Failed to load model: {str(e)}")
+        id2label = model.config.id2label
+        label2id = model.config.label2id
+        print("✅ Model loaded successfully!")
+    else:
+        print("No existing model found. Training new model...")
+        train_model()
 
-def classify_issue(text: str) -> Dict[str, Any]:
-    """Classify a text input into one of the civic issue categories"""
+def classify_issue(text: str):
+    """Classify a single text input"""
     if model is None or tokenizer is None:
-        raise HTTPException(status_code=500, detail="Model not loaded")
+        raise HTTPException(status_code=500, detail="Model not loaded properly")
     
     inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
     with torch.no_grad():
@@ -52,7 +127,7 @@ def classify_issue(text: str) -> Dict[str, Any]:
         probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
         predicted_class_id = probs.argmax().item()
     
-    predicted_label = model.config.id2label[predicted_class_id]
+    predicted_label = id2label[predicted_class_id]
     confidence = probs[0][predicted_class_id].item()
     
     return {
@@ -61,60 +136,76 @@ def classify_issue(text: str) -> Dict[str, Any]:
         "confidence": round(confidence, 4)
     }
 
+@app.on_event("startup")
+async def startup_event():
+    """Load model on startup"""
+    load_model()
+
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "Text Classification API for Civic Issues",
+        "message": "Civic Issues Text Classifier API",
         "version": "1.0.0",
         "endpoints": {
-            "classify": "/classify",
-            "health": "/health",
-            "docs": "/docs"
+            "/predict": "POST - Classify a single text",
+            "/predict/batch": "POST - Classify multiple texts",
+            "/health": "GET - Health check",
+            "/docs": "GET - API documentation"
         }
     }
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    model_loaded = model is not None and tokenizer is not None
+    model_status = "loaded" if model is not None else "not_loaded"
     return {
-        "status": "healthy" if model_loaded else "unhealthy",
-        "model_loaded": model_loaded
+        "status": "healthy",
+        "model_status": model_status,
+        "categories": ["streetlight", "garbage", "potholes"]
     }
 
-@app.post("/classify", response_model=PredictionResponse)
-async def classify_text(input_data: TextInput):
-    """
-    Classify text into civic issue categories
-    
-    Categories:
-    - streetlight: Issues related to street lighting
-    - garbage: Issues related to waste management
-    - potholes: Issues related to road conditions
-    """
+@app.post("/predict", response_model=PredictionResponse)
+async def predict_single(input_data: TextInput):
+    """Predict category for a single text input"""
     try:
         result = classify_issue(input_data.text)
         return PredictionResponse(**result)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
-@app.get("/categories")
-async def get_categories():
-    """Get available classification categories"""
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model not loaded")
+@app.post("/predict/batch")
+async def predict_batch(texts: list[str]):
+    """Predict categories for multiple text inputs"""
+    try:
+        results = []
+        for text in texts:
+            result = classify_issue(text)
+            results.append(result)
+        return {"predictions": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch prediction failed: {str(e)}")
+
+@app.get("/examples")
+async def get_examples():
+    """Get example texts for testing the API"""
+    examples = [
+        "The streetlight near my home is broken",
+        "There is garbage dumped on the roadside", 
+        "The road has a big pothole causing accidents",
+        "road me gadhha hai",
+        "streetlight khrab hai",
+        "kachra faila hua hai"
+    ]
     
-    return {
-        "categories": list(model.config.id2label.values()),
-        "description": {
-            "streetlight": "Issues related to street lighting problems",
-            "garbage": "Issues related to waste management and cleanliness",
-            "potholes": "Issues related to road conditions and potholes"
-        }
-    }
+    try:
+        predictions = []
+        for text in examples:
+            result = classify_issue(text)
+            predictions.append(result)
+        return {"examples": predictions}
+    except Exception as e:
+        return {"examples": examples, "note": "Model not ready for predictions yet"}
 
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
